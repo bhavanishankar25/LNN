@@ -7,6 +7,7 @@ observations. If dt is not provided, uniform spacing of 1.0 is assumed.
 
 import torch
 import torch.nn as nn
+from typing import Optional
 from .cell import CfCCell
 
 
@@ -33,7 +34,7 @@ class LiquidNet(nn.Module):
     def forward(
         self,
         x: torch.Tensor,               # (batch, seq_len, input_size)
-        dt: torch.Tensor | None = None, # (batch, seq_len, 1)
+        dt: Optional[torch.Tensor] = None, # (batch, seq_len, 1)
     ) -> torch.Tensor:                  # (batch, seq_len, output_size)
         batch_size, seq_len, _ = x.shape
 

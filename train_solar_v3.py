@@ -151,10 +151,16 @@ def engineer_features(features, kp):
     return np.column_stack([features, dbz, dspeed, bz_3h, speed_6h, epsilon, kp_lag1, kp_lag3, kp_lag6])
 
 
-def make_sequences_fast(features, kp, timestamps, seq_len, lead):
+def compute_dt_hours(timestamps):
+    dt = np.ones(len(timestamps), dtype=np.float32)
+    for i in range(1, len(timestamps)):
+        dt[i] = (timestamps[i] - timestamps[i - 1]).total_seconds() / 3600.0
+    return dt
+
+
+def make_sequences_fast(features, kp, dt_hours, timestamps, seq_len, lead):
     """Vectorized sequence building — 100x faster than a Python loop."""
     n = len(features)
-    n_feat = features.shape[1]
     total = n - seq_len - lead + 1
 
     # Build a NaN mask for features: True where ANY feature is NaN in that row
@@ -183,11 +189,12 @@ def make_sequences_fast(features, kp, timestamps, seq_len, lead):
     # X[i] = features[valid_indices[i] : valid_indices[i] + seq_len]
     idx_matrix = valid_indices[:, None] + np.arange(seq_len)[None, :]  # (n_valid, seq_len)
     X = features[idx_matrix]  # (n_valid, seq_len, n_feat)
+    DT = dt_hours[idx_matrix][..., None]  # (n_valid, seq_len, 1)
     Y = kp[target_indices[valid_indices]]  # (n_valid,)
 
     dates = [timestamps[target_indices[i]] for i in valid_indices]
 
-    return X, Y, dates
+    return X, DT, Y, dates
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +220,7 @@ class StormWeightedHuber(nn.Module):
 # Training one model
 # ---------------------------------------------------------------------------
 
-def train_one(model, X_train_t, Y_train_t, X_val_t, Y_val_t, seed, device):
+def train_one(model, X_train_t, DT_train_t, Y_train_t, X_val_t, DT_val_t, Y_val_t, seed, device):
     torch.manual_seed(seed)
     for p in model.parameters():
         if p.dim() >= 2:
@@ -239,7 +246,7 @@ def train_one(model, X_train_t, Y_train_t, X_val_t, Y_val_t, seed, device):
 
         for s in range(0, n, BATCH_SIZE):
             idx = perm[s:s + BATCH_SIZE]
-            pred = model(X_train_t[idx])[:, -1, 0]
+            pred = model(X_train_t[idx], DT_train_t[idx])[:, -1, 0]
             loss = loss_fn(pred, Y_train_t[idx])
 
             optimizer.zero_grad()
@@ -257,7 +264,7 @@ def train_one(model, X_train_t, Y_train_t, X_val_t, Y_val_t, seed, device):
             with torch.no_grad():
                 preds = []
                 for s in range(0, len(X_val_t), BATCH_SIZE):
-                    preds.append(model(X_val_t[s:s + BATCH_SIZE])[:, -1, 0])
+                    preds.append(model(X_val_t[s:s + BATCH_SIZE], DT_val_t[s:s + BATCH_SIZE])[:, -1, 0])
                 val_loss = eval_fn(torch.cat(preds), Y_val_t).item()
 
             if val_loss < best_val_loss:
@@ -354,14 +361,18 @@ def main():
     val_feat = (val_feat - feat_mean) / feat_std
     test_feat = (test_feat - feat_mean) / feat_std
 
+    train_dt = compute_dt_hours(train_ts)
+    val_dt = compute_dt_hours(val_ts)
+    test_dt = compute_dt_hours(test_ts)
+
     # --- Sequences (vectorized) ---
     print("\nBuilding sequences (vectorized)...")
     print("  Train:", end=" ")
-    X_train, Y_train, _ = make_sequences_fast(train_feat, train_kp, train_ts, SEQ_LEN, LEAD_TIME)
+    X_train, DT_train, Y_train, _ = make_sequences_fast(train_feat, train_kp, train_dt, train_ts, SEQ_LEN, LEAD_TIME)
     print("  Val:", end=" ")
-    X_val, Y_val, val_dates = make_sequences_fast(val_feat, val_kp, val_ts, SEQ_LEN, LEAD_TIME)
+    X_val, DT_val, Y_val, val_dates = make_sequences_fast(val_feat, val_kp, val_dt, val_ts, SEQ_LEN, LEAD_TIME)
     print("  Test:", end=" ")
-    X_test, Y_test, test_dates = make_sequences_fast(test_feat, test_kp, test_ts, SEQ_LEN, LEAD_TIME)
+    X_test, DT_test, Y_test, test_dates = make_sequences_fast(test_feat, test_kp, test_dt, test_ts, SEQ_LEN, LEAD_TIME)
 
     storm_train = 100 * (Y_train >= 5).mean()
     storm_test = 100 * (Y_test >= 5).mean()
@@ -371,12 +382,16 @@ def main():
     # To GPU/MPS
     print("Moving data to device...")
     X_train_t = torch.FloatTensor(X_train).to(device)
+    DT_train_t = torch.FloatTensor(DT_train).to(device)
     Y_train_t = torch.FloatTensor(Y_train).to(device)
     X_val_t = torch.FloatTensor(X_val).to(device)
+    DT_val_t = torch.FloatTensor(DT_val).to(device)
     Y_val_t = torch.FloatTensor(Y_val).to(device)
     X_test_t = torch.FloatTensor(X_test).to(device)
+    DT_test_t = torch.FloatTensor(DT_test).to(device)
     Y_test_t = torch.FloatTensor(Y_test).to(device)
     print(f"  Train tensor: {X_train_t.shape} ({X_train_t.nbytes / 1e9:.2f} GB)")
+    print(f"  Train dt:     {DT_train_t.shape}")
     print()
 
     input_size = train_feat.shape[1]
@@ -407,7 +422,7 @@ def main():
             print(f"    Parameters: {n_params:,}")
 
         trained, val_loss = train_one(
-            model, X_train_t, Y_train_t, X_val_t, Y_val_t,
+            model, X_train_t, DT_train_t, Y_train_t, X_val_t, DT_val_t, Y_val_t,
             seed=42 + m_idx, device=device
         )
         ensemble_models.append(trained)
@@ -425,7 +440,7 @@ def main():
         for model in ensemble_models:
             preds = []
             for s in range(0, len(X_val_t), BATCH_SIZE):
-                preds.append(model(X_val_t[s:s + BATCH_SIZE])[:, -1, 0])
+                preds.append(model(X_val_t[s:s + BATCH_SIZE], DT_val_t[s:s + BATCH_SIZE])[:, -1, 0])
             val_preds_all.append(torch.cat(preds).cpu().numpy())
         val_pred = np.mean(val_preds_all, axis=0)
 
@@ -459,7 +474,7 @@ def main():
         for model in ensemble_models:
             preds = []
             for s in range(0, len(X_test_t), BATCH_SIZE):
-                preds.append(model(X_test_t[s:s + BATCH_SIZE])[:, -1, 0])
+                preds.append(model(X_test_t[s:s + BATCH_SIZE], DT_test_t[s:s + BATCH_SIZE])[:, -1, 0])
             test_preds_all.append(torch.cat(preds).cpu().numpy())
         predicted = np.mean(test_preds_all, axis=0)
 

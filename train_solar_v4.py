@@ -194,7 +194,14 @@ def engineer_features(features, kp):
     return np.column_stack([features, eng_arr]), eng_names
 
 
-def make_sequences_fast(features, kp, timestamps, seq_len, lead):
+def compute_dt_hours(timestamps):
+    dt = np.ones(len(timestamps), dtype=np.float32)
+    for i in range(1, len(timestamps)):
+        dt[i] = (timestamps[i] - timestamps[i - 1]).total_seconds() / 3600.0
+    return dt
+
+
+def make_sequences_fast(features, kp, dt_hours, timestamps, seq_len, lead):
     n = len(features)
     total = n - seq_len - lead + 1
 
@@ -212,10 +219,11 @@ def make_sequences_fast(features, kp, timestamps, seq_len, lead):
 
     idx_mat = vi[:, None] + np.arange(seq_len)[None, :]
     X = features[idx_mat]
+    DT = dt_hours[idx_mat][..., None]
     Y = kp[target_idx[vi]]
     dates = [timestamps[target_idx[i]] for i in vi]
 
-    return X, Y, dates
+    return X, DT, Y, dates
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +249,7 @@ class StormWeightedHuber(nn.Module):
 # Train one model
 # ---------------------------------------------------------------------------
 
-def train_one(model, X_tr, Y_tr, X_val, Y_val, seed, device):
+def train_one(model, X_tr, DT_tr, Y_tr, X_val, DT_val, Y_val, seed, device):
     torch.manual_seed(seed)
     for p in model.parameters():
         if p.dim() >= 2:
@@ -265,7 +273,7 @@ def train_one(model, X_tr, Y_tr, X_val, Y_val, seed, device):
 
         for s in range(0, n, BATCH_SIZE):
             idx = perm[s:s + BATCH_SIZE]
-            pred = model(X_tr[idx])[:, -1, 0]
+            pred = model(X_tr[idx], DT_tr[idx])[:, -1, 0]
             loss = loss_fn(pred, Y_tr[idx])
             opt.zero_grad()
             loss.backward()
@@ -279,7 +287,7 @@ def train_one(model, X_tr, Y_tr, X_val, Y_val, seed, device):
         if epoch % 5 == 0 or epoch == 1:
             model.eval()
             with torch.no_grad():
-                ps = [model(X_val[s:s+BATCH_SIZE])[:, -1, 0] for s in range(0, len(X_val), BATCH_SIZE)]
+                ps = [model(X_val[s:s+BATCH_SIZE], DT_val[s:s+BATCH_SIZE])[:, -1, 0] for s in range(0, len(X_val), BATCH_SIZE)]
                 vl = eval_fn(torch.cat(ps), Y_val).item()
 
             if vl < best_val:
@@ -366,14 +374,18 @@ def main():
     val_feat = (val_feat - mu) / std
     test_feat = (test_feat - mu) / std
 
+    train_dt = compute_dt_hours(train_ts)
+    val_dt = compute_dt_hours(val_ts)
+    test_dt = compute_dt_hours(test_ts)
+
     # Sequences
     print("Building sequences...")
     print("  Train: ", end="")
-    X_tr, Y_tr, _ = make_sequences_fast(train_feat, train_kp, train_ts, SEQ_LEN, LEAD_TIME)
+    X_tr, DT_tr, Y_tr, _ = make_sequences_fast(train_feat, train_kp, train_dt, train_ts, SEQ_LEN, LEAD_TIME)
     print("  Val:   ", end="")
-    X_val, Y_val, val_dates = make_sequences_fast(val_feat, val_kp, val_ts, SEQ_LEN, LEAD_TIME)
+    X_val, DT_val, Y_val, val_dates = make_sequences_fast(val_feat, val_kp, val_dt, val_ts, SEQ_LEN, LEAD_TIME)
     print("  Test:  ", end="")
-    X_te, Y_te, test_dates = make_sequences_fast(test_feat, test_kp, test_ts, SEQ_LEN, LEAD_TIME)
+    X_te, DT_te, Y_te, test_dates = make_sequences_fast(test_feat, test_kp, test_dt, test_ts, SEQ_LEN, LEAD_TIME)
 
     print(f"\n  Storm %: train {100*(Y_tr>=5).mean():.1f}%, test {100*(Y_te>=5).mean():.1f}%")
     print()
@@ -381,12 +393,16 @@ def main():
     # To device
     print("Moving to device...")
     X_tr_t = torch.FloatTensor(X_tr).to(device)
+    DT_tr_t = torch.FloatTensor(DT_tr).to(device)
     Y_tr_t = torch.FloatTensor(Y_tr).to(device)
     X_val_t = torch.FloatTensor(X_val).to(device)
+    DT_val_t = torch.FloatTensor(DT_val).to(device)
     Y_val_t = torch.FloatTensor(Y_val).to(device)
     X_te_t = torch.FloatTensor(X_te).to(device)
+    DT_te_t = torch.FloatTensor(DT_te).to(device)
     Y_te_t = torch.FloatTensor(Y_te).to(device)
     print(f"  Train: {X_tr_t.shape} ({X_tr_t.nbytes/1e9:.2f} GB)")
+    print(f"  Train dt: {DT_tr_t.shape}")
     print()
 
     input_size = train_feat.shape[1]
@@ -409,7 +425,7 @@ def main():
         if n_params is None:
             n_params = sum(p.numel() for p in m.parameters())
             print(f"    Parameters: {n_params:,}")
-        m, _ = train_one(m, X_tr_t, Y_tr_t, X_val_t, Y_val_t, 42 + i, device)
+        m, _ = train_one(m, X_tr_t, DT_tr_t, Y_tr_t, X_val_t, DT_val_t, Y_val_t, 42 + i, device)
         models.append(m)
         print()
 
@@ -420,15 +436,15 @@ def main():
     for m in models:
         m.eval()
 
-    def ensemble_predict(X_t):
+    def ensemble_predict(X_t, DT_t):
         with torch.no_grad():
             all_p = []
             for m in models:
-                ps = [m(X_t[s:s+BATCH_SIZE])[:, -1, 0] for s in range(0, len(X_t), BATCH_SIZE)]
+                ps = [m(X_t[s:s+BATCH_SIZE], DT_t[s:s+BATCH_SIZE])[:, -1, 0] for s in range(0, len(X_t), BATCH_SIZE)]
                 all_p.append(torch.cat(ps).cpu().numpy())
             return np.mean(all_p, axis=0)
 
-    val_pred = ensemble_predict(X_val_t)
+    val_pred = ensemble_predict(X_val_t, DT_val_t)
     val_actual = Y_val[:len(val_pred)]
     val_storm = val_actual >= 5.0
 
@@ -450,7 +466,7 @@ def main():
     # ===================================================================
     # TEST EVALUATION
     # ===================================================================
-    raw_pred = ensemble_predict(X_te_t)
+    raw_pred = ensemble_predict(X_te_t, DT_te_t)
     actual = Y_te[:len(raw_pred)]
 
     # Temporal smoothing (3h rolling mean)
@@ -523,12 +539,13 @@ def main():
     # Speed
     import time
     x1 = X_te_t[:1]
+    dt1 = DT_te_t[:1]
     models[0].eval()
     for _ in range(10):
-        models[0](x1)
+        models[0](x1, dt1)
     t0 = time.perf_counter()
     for _ in range(1000):
-        models[0](x1)
+        models[0](x1, dt1)
     us = (time.perf_counter() - t0) / 1000 * 1e6
     print(f"\n  Inference: {us:.0f} us (single) | {us*N_ENSEMBLE:.0f} us (ensemble)")
     print(f"  Total params: {n_params:,} x {N_ENSEMBLE} = {n_params*N_ENSEMBLE:,}")
