@@ -3,12 +3,13 @@
 Train LiquidNet v4 — maximum accuracy.
 
 Changes from v3:
-  1. More OMNI2 features: +electric field, plasma beta, Alfven Mach, Dst, AE
-  2. Bigger model: 96 hidden x 2 layers (~68K params, was 3.7K)
-  3. Ensemble of 5 models (was 3)
-  4. 72h sequences (was 48h)
-  5. Temporal smoothing (3h rolling mean on output)
-  6. More engineered features: d_bt, d_density, d_dst, dst lags
+  1. 16 raw OMNI2 features (was 11): +Bx, By, sunspot, F10.7, magnetosonic Mach
+  2. 17 engineered features (was 15): +clock angle, ae_lag1
+  3. 33 total features (was 26)
+  4. Bigger model: 96 hidden x 2 layers (~75K params, was 3.7K)
+  5. Ensemble of 5 models (was 3)
+  6. 72h sequences (was 48h)
+  7. Temporal smoothing (3h rolling mean on output)
 
 Usage:
     python3 -u train_solar_v4.py
@@ -53,17 +54,25 @@ N_ENSEMBLE = 5         # more models
 # OMNI2 columns: (index, fill_value)
 # v3 had 6 raw features. v4 adds 5 more.
 COLS_INPUT = {
-    # v3 features
+    # Magnetic field (complete 3D vector)
     "bt":            (8,  999.9),       # |B| total field, nT
+    "bx_gsm":        (12, 999.9),       # Bx GSM, nT — sun-earth direction
+    "by_gsm":        (15, 999.9),       # By GSM, nT — dusk-dawn direction
     "bz_gsm":        (16, 999.9),       # Bz GSM, nT — #1 storm driver
+    # Solar wind plasma
     "speed":         (24, 9999.),       # solar wind speed, km/s
     "density":       (23, 999.9),       # proton density, N/cm³
     "temp":          (22, 9999999.),    # proton temperature, K
     "pressure":      (28, 99.99),       # flow pressure, nPa
-    # v4 additions
+    # Derived quantities
     "electric_field": (35, 999.99),     # E field, mV/m (v × B)
     "plasma_beta":   (36, 999.99),      # plasma/magnetic pressure ratio
     "alfven_mach":   (37, 999.9),       # Alfven Mach number
+    "mach_magneto":  (54, 99.9),        # magnetosonic Mach — shock formation
+    # Solar activity
+    "sunspot":       (39, 999),         # sunspot number — solar cycle phase
+    "f107":          (50, 999.9),       # F10.7 solar radio flux — solar activity proxy
+    # Geomagnetic indices (as input)
     "dst":           (40, 99999),       # Dst index, nT — storm indicator (hourly)
     "ae":            (41, 9999),        # AE auroral electrojet, nT — substorm indicator
 }
@@ -127,17 +136,19 @@ def fill_forward(arr):
 
 
 def engineer_features(features, kp):
-    """v4: more engineered features than v3."""
+    """v4: 17 engineered features from 16 raw inputs."""
     n = len(features)
 
     # Name lookup for raw features
     fi = {name: i for i, name in enumerate(FEAT_NAMES)}
 
     bz = features[:, fi["bz_gsm"]]
+    by = features[:, fi["by_gsm"]]
     bt = features[:, fi["bt"]]
     speed = features[:, fi["speed"]]
     density = features[:, fi["density"]]
     dst = features[:, fi["dst"]]
+    ae = features[:, fi["ae"]]
 
     def diff(x):
         d = np.zeros(n, dtype=np.float32)
@@ -153,19 +164,20 @@ def engineer_features(features, kp):
         return np.convolve(x, np.ones(w) / w, mode='same').astype(np.float32)
 
     engineered = {
-        # Rate of change (how fast things are shifting)
+        # Rate of change
         "d_bz":       diff(bz),
         "d_bt":       diff(bt),
         "d_speed":    diff(speed),
         "d_density":  diff(density),
         "d_dst":      diff(dst),
-        # Rolling means (trends)
+        # Rolling means
         "bz_3h":      rolling_mean(bz, 3),
         "bt_6h":      rolling_mean(bt, 6),
         "speed_6h":   rolling_mean(speed, 6),
         "density_3h": rolling_mean(density, 3),
-        # Coupling functions (physics-based)
-        "epsilon":    (speed * np.clip(-bz, 0, None)).astype(np.float32),
+        # Physics-based coupling functions
+        "epsilon":    (speed * np.clip(-bz, 0, None)).astype(np.float32),  # Perreault-Akasofu
+        "clock_angle": np.arctan2(by, bz).astype(np.float32),             # IMF clock angle
         # Autoregressive Kp
         "kp_lag1":    lag(kp, 1),
         "kp_lag3":    lag(kp, 3),
@@ -173,6 +185,8 @@ def engineer_features(features, kp):
         # Autoregressive Dst
         "dst_lag1":   lag(dst, 1),
         "dst_lag3":   lag(dst, 3),
+        # Autoregressive AE
+        "ae_lag1":    lag(ae, 1),
     }
 
     eng_names = list(engineered.keys())
